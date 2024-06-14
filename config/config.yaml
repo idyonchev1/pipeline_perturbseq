@@ -1,0 +1,20 @@
+cluster:
+  mkdir -p logs &&
+  sbatch
+    --cpus-per-task={threads}
+    --cores={threads}
+    --mem={resources.mem_mb}
+    --time="24:00:00"
+    --job-name={rule}
+    --output=logs/{rule}.out
+    --error=logs/{rule}.err
+    --parsable 
+
+default-resources:
+  - time="24:00:00" 
+
+set-resources:
+    --cellranger:mem_mb=128000
+    --cellranger:cpus_per_task=16
+
+slurm: True 

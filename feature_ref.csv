@@ -1,0 +1,2 @@
+id,name,read,pattern,sequence,feature_type,target_gene_id,target_gene_name
+GAPDH-1,GAPDH-1,R2,NTNNNGCTTAGCTCTNAAAC(BC),NNNNNNNNNNNNNNNNN,CRISPR Guide Capture,ENSG00000111640,GAPDH

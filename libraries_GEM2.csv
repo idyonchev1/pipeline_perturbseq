@@ -1,0 +1,3 @@
+fastqs,sample,library_type
+/absolutepath/input/GEM2,mRNA_GEM2,Gene Expression
+/absolutepath/input/GEM2,sgRNA_GEM2,CRISPR Guide Capture

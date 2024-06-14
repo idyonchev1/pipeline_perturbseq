@@ -1,0 +1,3 @@
+fastqs,sample,library_type
+/absolutepath/input/,mRNA_GEM1,Gene Expression
+/absolutepath/input/,sgRNA_GEM1,CRISPR Guide Capture
