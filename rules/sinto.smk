@@ -8,10 +8,8 @@ import pandas as pd
 samples_table = pd.read_table("samples.txt")
 samples=list(samples_table.Samples.unique())
 
-num_targets = len(target)
-
 rule all:
-    input:[expand("logs/{samples}_sinto_done.txt",samples=samples),expand("logs/{samples}_index_done.txt",samples=samples)]
+    input:[expand("logs/{samples}_sinto_done.txt",samples=samples)]
 
 rule extract_targets_sinto:
     input:
@@ -26,18 +24,9 @@ rule extract_targets_sinto:
         time="2-00:00:00"
     conda:
         "sinto"
-    shell:"sinto filterbarcodes -b {input.sample} -c {input.targets} --outdir demultiplex_cells/{wildcards.samples} -p 32 &> {log}"
-
-rule index:
-    input:"logs/{samples}_sinto_done.txt"
-    output:touch("logs/{samples}_index_done.txt")
-    threads:1
-    resources:
-        mem_mb=4000,
-        time="24:00:00"
     shell:
         """
-        for bamfile in demultiplex_cells/{wildcards.samples}/*.bam; do
-            samtools index $bamfile
-        done
+        sinto filterbarcodes -b {input.sample} -c {input.targets} --outdir demultiplex_cells/{wildcards.samples} -p 32 &> {log}
+        rm demultiplex_cells/{wildcards.samples}/*_*
+        samtools index -M demultiplex_cells/{wildcards.samples}/*bam
         """
