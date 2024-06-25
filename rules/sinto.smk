@@ -14,7 +14,7 @@ targets_table = pd.read_table("targets.txt")
 target=list(targets_table.Target.unique())
 
 rule all:
-    input:[expand("logs/{samples}_sinto_done.txt",samples=samples),expand("demultiplex_cells/{target}_deduplicated_merged.bam",target=target),expand("demultiplex_cells/tracks/{target}_fwd.bw",target=target),expand("demultiplex_cells/tracks/{target}_rev.bw",target=target)]
+    input:[expand("logs/{samples}_sinto_done.txt",samples=samples),expand("demultiplex_cells/{target}_deduplicated_merged.bam",target=target),expand("demultiplex_cells/tracks/{target}_fwd.bw",target=target),expand("demultiplex_cells/tracks/{target}_rev.bw",target=target),"probe_design/fastq/Non-Targeting.1.fastq.gz"]
 
 rule extract_targets_sinto:
     input:
@@ -81,6 +81,31 @@ rule merge:
         samtools index -M {output}
         """
 
+rule extract_control_reads:
+    input:
+        "demultiplex_cells/Non-Targeting_deduplicated_merged.bam"
+    threads:4
+    resources:
+        mem_mb=10000,
+        time="24:00:00"
+    log:
+        "logs/extract_control_reads.log"
+    output:
+        read1_temp=temp("probe_design/fastq/Non-Targeting-untrimmed.1.fastq"),
+        read2_un=temp("probe_design/fastq/Non-Targeting.2.fastq"),
+        read1_un=temp("probe_design/fastq/Non-Targeting.1.fastq"),
+        read1="probe_design/fastq/Non-Targeting.1.fastq.gz",
+        read2="probe_design/fastq/Non-Targeting.2.fastq.gz"
+    conda:
+        "cgat-apps"
+    shell:
+        """
+        samtools collate -u -O {input} -@4 | samtools fastq -f 3 -1 {output.read1_temp} -2 {output.read2_un} -@4 &> {log}
+        cutadapt -u 13 {output.read1_temp} -o {output.read1_un} &> {log}
+        gzip {output.read1_un}
+        gzip {output.read2_un}
+        """
+
 rule export_stranded_bigwigs:
     input:
         "demultiplex_cells/{target}_deduplicated_merged.bam"
@@ -92,7 +117,7 @@ rule export_stranded_bigwigs:
         revbam2=temp("demultiplex_cells/tracks/{target}_rev2.bam"),
         revbam=temp("demultiplex_cells/tracks/{target}_rev.bam"),
         fwdbw="demultiplex_cells/tracks/{target}_fwd.bw",
-        revbw="demultiplex_cells/tracks/{target}_rev_temp.bw"
+        revbw="demultiplex_cells/tracks/{target}_rev.bw"
     log:
         "logs/tracks/deeptools_{target}.log"
     threads: 4
@@ -111,7 +136,7 @@ rule export_stranded_bigwigs:
         samtools view -b -f 64 -F 16 {input} > {output.fwdbam2}
         samtools merge -f {output.fwdbam} {output.fwdbam1} {output.fwdbam2}
         samtools index {output.fwdbam}
-        bamCoverage --bam {output.fwdbam} -o {output.fwdbw} -p 4 --normalizeUsing RPKM --exactScaling --binSize 10 --effectiveGenomeSize 2913022398 &> {log}
-        bamCoverage --bam {output.revbam} -o {output.revbw} -p 4 --normalizeUsing RPKM --exactScaling --binSize 10 --effectiveGenomeSize 2913022398 &> {log}
-        rm demultiplex_cells/tracks/*bai
+        bamCoverage --bam {output.revbam} -o {output.revbw} -p 4 --normalizeUsing RPKM --exactScaling --binSize 10 --effectiveGenomeSize 2913022398 &> {log} 
+        bamCoverage --bam {output.fwdbam} -o {output.fwdbw} -p 4 --normalizeUsing RPKM --exactScaling --binSize 10 --effectiveGenomeSize 2913022398 &> {log} 
+        rm demultiplex_cells/tracks/{wildcards.target}*.bai
         """
