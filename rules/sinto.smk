@@ -14,7 +14,7 @@ targets_table = pd.read_table("targets.txt")
 target=list(targets_table.Target.unique())
 
 rule all:
-    input:[expand("logs/{samples}_sinto_done.txt",samples=samples),expand("demultiplex_cells/{target}_deduplicated_merged.bam",target=target),expand("demultiplex_cells/tracks/{target}_fwd.bw",target=target),expand("demultiplex_cells/tracks/{target}_rev.bw",target=target),"probe_design/fastq/Non-Targeting.1.fastq.gz"]
+    input:[expand("logs/{samples}_sinto_done.txt",samples=samples),expand("demultiplex_cells/{target}_deduplicated_merged.bam",target=target),expand("demultiplex_cells/tracks/{target}_fwd.bw",target=target),expand("demultiplex_cells/tracks/{target}_rev.bw",target=target),"probe_design/fastq/Non-Targeting.1.fastq.gz","probe_design/fastq/Non-Targeting.2.fastq.gz","probe_design/Non-Targeting.bedgraph"]
 
 rule extract_targets_sinto:
     input:
@@ -102,9 +102,38 @@ rule extract_control_reads:
         """
         samtools collate -u -O {input} -@4 | samtools fastq -f 3 -1 {output.read1_temp} -2 {output.read2_un} -@4 &> {log}
         cutadapt -u 13 {output.read1_temp} -o {output.read1_un} &> {log}
-        gzip {output.read1_un}
-        gzip {output.read2_un}
+        gzip < {output.read1_un} > {output.read1}
+        gzip < {output.read2_un} > {output.read2}
         """
+
+rule map_control_reads_transcriptome:
+    input:
+        sample=["probe_design/fastq/Non-Targeting.1.fastq.gz", "probe_design/fastq/Non-Targeting.2.fastq.gz"]
+    output:
+        out1=temp("probe_design/Non-Targeting_unsorted.bam"),
+        out2="probe_design/Non-Targeting_sorted_deduplicated.bam"
+    log:
+        "logs/map_control_reads_transcriptome.log",
+    threads:8
+    resources:
+        mem_mb=100000,
+        time="24:00:00"
+    shell:
+        """
+        bowtie2 -x bowtie2_transcriptome_index/refdata-gex-GRCh38-2024-A-dCas9Zim3 -1 {input[0]} -2 {input[1]} -X 2000 --very-sensitive -p 8| samtools view -f 3 -q 30 -bS -  > {output.out1}
+        samtools sort {output.out1} -@ 8 -o {output.out2}
+        samtools index {output.out2}        
+        """
+
+rule export_bedgraph:
+    input:"probe_design/{sample}_sorted_deduplicated.bam"
+    output:"probe_design/{sample}.bedgraph"
+    threads: 1
+    resources:
+        mem_mb=8000,
+        time="24:00:00"
+    shell:
+        "genomeCoverageBed -bga -ibam {input} | sort -k1,1 -k2,2n > {output}"
 
 rule export_stranded_bigwigs:
     input:
