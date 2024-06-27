@@ -117,10 +117,10 @@ rule map_control_reads_transcriptome:
     threads:8
     resources:
         mem_mb=100000,
-        time="24:00:00"
+        time="3-00:00:00"
     shell:
         """
-        bowtie2 -x bowtie2_transcriptome_index/refdata-gex-GRCh38-2024-A-dCas9Zim3 -1 {input[0]} -2 {input[1]} -X 2000 --very-sensitive -p 8| samtools view -f 3 -q 30 -bS -  > {output.out1}
+        bowtie2 -x bowtie2_transcriptome_index/refdata-gex-GRCh38-2024-A-dCas9Zim3 -1 {input[0]} -2 {input[1]} -X 600 --very-sensitive-local -p 8 --no-mixed --no-discordant -k 100 2>>{log} | samtools view -f 3 -bS - > {output.out1} 
         samtools sort {output.out1} -@ 8 -o {output.out2}
         samtools index {output.out2}        
         """
