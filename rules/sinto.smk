@@ -81,9 +81,27 @@ rule merge:
         samtools index -M {output}
         """
 
+#bedtools intersect extracts individual reads that overlap the region whereas pairToBed extracts the pair when one read maps to the region
+rule filter_roi:
+    input:
+        infile="demultiplex_cells/Non-Targeting_deduplicated_merged.bam",
+        gtf="demultiplex_cells/roi.gtf"
+    threads:4
+    resources:
+        mem_mb=10000,
+        time="24:00:00"
+    output:
+        "demultiplex_cells/Non-Targeting_roi.bam"
+    shell:
+        """
+        samtools sort -n -o "Non-Targeting_namesorted.bam" {input.infile}
+        pairToBed -abam "Non-Targeting_namesorted.bam" -b {input.gtf} > {output}
+        """
+
+#cutadapt used to trim first 13 bases of read 1 as the TSO is not removed by cellranger from the bam file sequence.
 rule extract_control_reads:
     input:
-        "demultiplex_cells/Non-Targeting_deduplicated_merged.bam"
+        "demultiplex_cells/Non-Targeting_roi.bam"
     threads:4
     resources:
         mem_mb=10000,
@@ -120,7 +138,7 @@ rule map_control_reads_transcriptome:
         time="3-00:00:00"
     shell:
         """
-        bowtie2 -x bowtie2_transcriptome_index/refdata-gex-GRCh38-2024-A-dCas9Zim3 -1 {input[0]} -2 {input[1]} -X 600 --very-sensitive-local -p 8 --no-mixed --no-discordant -k 100 2>>{log} | samtools view -f 3 -bS - > {output.out1} 
+        bowtie2 -x bowtie2_transcriptome_index/refdata-gex-GRCh38-2024-A-dCas9Zim3 -1 {input[0]} -2 {input[1]} -X 600 --very-sensitive-local -p 8 --no-mixed --no-discordant -k 10 2>>{log} | samtools view -f 99 -bS - > {output.out1} 
         samtools sort {output.out1} -@ 8 -o {output.out2}
         samtools index {output.out2}        
         """
