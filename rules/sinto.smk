@@ -110,7 +110,7 @@ rule export_stranded_bigwigs:
         samtools view -b -f 64 -F 16 {input} > {output.fwdbam2}
         samtools merge -f {output.fwdbam} {output.fwdbam1} {output.fwdbam2}
         samtools index {output.fwdbam}
-        bamCoverage --bam {output.revbam} -o {output.revbw} -p 4 --normalizeUsing RPKM --exactScaling --binSize 10 --effectiveGenomeSize 2913022398 &> {log} 
-        bamCoverage --bam {output.fwdbam} -o {output.fwdbw} -p 4 --normalizeUsing RPKM --exactScaling --binSize 10 --effectiveGenomeSize 2913022398 &> {log} 
+        bamCoverage --bam {output.revbam} -o {output.revbw} -p 4 --normalizeUsing RPKM --exactScaling --binSize 1 --effectiveGenomeSize 2913022398 &> {log} 
+        bamCoverage --bam {output.fwdbam} -o {output.fwdbw} -p 4 --normalizeUsing RPKM --exactScaling --binSize 1 --effectiveGenomeSize 2913022398 &> {log} 
         rm demultiplex_cells/tracks/{wildcards.target}*.bai
         """

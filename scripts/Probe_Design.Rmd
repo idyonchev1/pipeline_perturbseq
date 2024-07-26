@@ -1,0 +1,890 @@
+Author: Ivaylo Yonchev
+Date: July 2024
+This is the first iteration of a hybridization-enrichment probe design analysis using 5' single-cell RNA-seq data based on Replogle, et al,  Nat Biotechnol 38, 954–961 (2020) https://doi.org/10.1038/s41587-020-0470-y. The Perturb-seq and salmon_quant pipelines are required.
+
+```{r}
+#First, we run map_salmon.smk from salmon_quant pipeline to obtain genes containing transcripts with a TPM >1 according to salmon. The transcriptome for salmon was generated using agat_sp_extract_sequences.pl --gff genes.gtf --fasta ./genome.fa -t exon --merge -o refdata-gex-GRCh38-2024-A-dCas9Zim3.fa , where genes.gtf and genome.fa are from ensembl 110 refdata-gex-GRCh38-2024-A release provided with Cellranger v8.0.1, with dCas9-Zim3 added as an additional contig.
+
+#In this specific case, we have two RNA-seq replicates.
+
+#I provide all_ensg_enst.txt as a legend for gene-transcript relationship generated using scripts/generate_ensg_enst_legend.sh.
+
+#I also provide a list of predefined transcripts that serve as positive controls or overlap our region of interest for our specific experiment as ENSTs_in_PC.txt and ENSTs_in_ROI.txt.
+
+library(dplyr)
+library(plyr)
+library(stringr)
+library(tidyverse)
+
+salmon_rep1 <- read.csv("data/salmon/R1//quant.sf",sep="\t")
+salmon_rep2 <- read.csv("data/salmon/R2//quant.sf",sep="\t")
+
+salmon_merged <- merge(salmon_rep1,salmon_rep2,by="Name")
+
+#For this particular experiment, we use transcripts that overlap a particular region of interest. However alternative transcripts from the same gene can sometimes start downstream from our overlapping region of interest. We want to retain those as well. Using scripts/generate_ensg_enst_legend.sh I obtain the ENSG ENST annotation for each transcript, then extract all transcripts in our ROI or positive control annotations which belong to the same gene, to feed back into featurecounts.
+
+all_enst <- read.csv("./all_ensg_enst.txt",sep=" ",header=F)
+all_enst <-as.data.frame(lapply(all_enst, function(x) gsub(";", "", x)))
+
+filter <- read.csv("ENSTs_in_ROI.txt",sep=" ",header=F)
+filter_pc <- read.csv("ENSTs_in_PC.txt",sep=" ",header=F)
+filter <- rbind(filter,filter_pc)
+filter <-as.data.frame(lapply(filter, function(x) gsub(";", "", x)))
+
+filter <- all_enst%>%
+  dplyr::filter(V1%in%filter$V1)
+
+names(filter) <- c("Gene","Transcript")
+filter <- unique(filter)
+salmon_merged$Transcript <- salmon_merged$Name
+salmon_merged$Transcript  <- gsub("\\..*", "", salmon_merged$Transcript)
+salmon_merged <- plyr::join(salmon_merged,filter,by="Transcript",type="left",match="first")
+salmon_merged <- salmon_merged%>%
+  dplyr::filter(salmon_merged$Transcript%in%filter$Transcript)
+salmon_merged$Average_TPM <- (salmon_merged$TPM.x+salmon_merged$TPM.y)/2
+
+detach("package:plyr")
+
+all_enst_export <- filter%>%
+  dplyr::select(Transcript)%>%
+  unique()
+
+write.table(all_enst_export,file="./featurecounts/enst_in_roi.txt",quote=F,row.names = F,col.names = F,sep="\t")
+
+salmon_merged <- salmon_merged%>%
+  group_by(Gene)%>%
+  dplyr::filter(max(TPM.x) >=1 | max(TPM.y) >=1)
+salmon_merged <- salmon_merged%>%
+  dplyr::filter(NumReads.x > 0 & NumReads.y > 0 & TPM.x >0 & TPM.y >0)
+
+
+salmon_merged <- salmon_merged %>%
+  group_by(Gene) %>%
+  mutate(max_TPM = max(Average_TPM)) %>%
+  filter(Average_TPM >= 0.2 * max_TPM) %>%
+  select(-max_TPM)
+```
+
+
+```{r}
+#After obtaining transcripts,scripts/filter_gtf.sh is run to extract all annotations for our transcripts of interest from genes.gtf. Next, pipeline_perturbseq is run to process our 5' CRISPR screening raw data. After this, good quality cell identities (>2500 detected genes, <15% mtRNA, >5000 UMIs) are extracted from the cell matrix in R and exported as a text file and fed into rules/sinto in order to demultiplex and deduplicate our bam file and generate smaller bam and bigwig files of our Non-Targeting control cells to be used for probe design and visualization. As 5' scRNA-seq data can produce spurious peaks at the 3' ends of transcripts, where the reverse transcription reaction begins and can terminate due to unsuccessful elongation, scripts/remove_last_exon.sh is run on the gtf to remove the last exon from every transcript which contains >2 exons.
+
+#Next, featurecounts.sh is run on the bam file and new gtf to extract all transcripts which account for >=80% of gene counts. If all transcripts for a specific gene are < 80%, convert the top transcript of that gene to 100% and recalculate all transcripts as a percentage of the top transcript, this time lowering the threshold to >=60%, as since no transcript accounts for >80% counts, we are more likely dealing with multiple non-overlapping transcripts.
+
+gex_gene_level <- read.csv("featurecounts/counts_5gex_gene.txt",skip=1,sep="\t")%>%
+  dplyr::select(Geneid,Non.Targeting_deduplicated_merged.bam)%>%
+  dplyr::filter(Non.Targeting_deduplicated_merged.bam>10 & Geneid%in%salmon_merged$Gene)
+
+gex_transcript_level <- read.csv("featurecounts/counts_5gex_transcript.txt",skip=1,sep="\t")%>%
+  dplyr::select(Geneid,Non.Targeting_deduplicated_merged.bam)%>%
+  dplyr::filter(Non.Targeting_deduplicated_merged.bam>10 & Geneid%in%salmon_merged$Transcript)
+
+gtf_data <- read.csv("./featurecounts/enst_in_roi_nolastexon.gtf",sep="\t",header=F)
+colnames(gtf_data) <- c("seqname", "source", "feature", "start", "end", "score", "strand", "frame", "attribute")
+
+gene_map <- gtf_data %>%
+  filter(feature == "transcript") %>%
+  mutate(
+    gene_id = str_extract(attribute, "gene_id ([^;]+)"),
+    gene_name = str_extract(attribute, "transcript_id ([^;]+)")
+  ) %>%
+  transmute(
+    gene_id = str_remove(gene_id, "gene_id "),
+    gene_name = str_remove(gene_name, "transcript_id ")
+  ) %>%
+  distinct(gene_id, gene_name)
+
+colnames(gene_map) <- c("Gene","Geneid")
+
+gex_transcript_level <- merge(gex_transcript_level,gene_map)
+colnames(gex_transcript_level) <- c("Transcript","T_counts","Gene")
+
+colnames(gex_gene_level) <- c("Gene","G_counts")
+
+gex_all <- merge(gex_transcript_level,gex_gene_level,by="Gene")
+
+gex_all$pct <- gex_all$T_counts/gex_all$G_counts
+gex_all_80 <- gex_all%>%
+  dplyr::filter(gex_all$pct>=0.80)
+
+length(unique(gex_all$Gene))
+length(unique(gex_all_80$Gene))
+
+gex_all_leftover <- gex_all%>%
+  dplyr::filter(!Gene%in%gex_all_80$Gene)
+
+gex_all_leftover <- gex_all_leftover %>%
+  group_by(Gene) %>%
+  mutate(max_T_counts = max(T_counts, na.rm = TRUE)) %>%
+  mutate(pct = T_counts / max_T_counts) %>%
+  ungroup() %>%
+  select(-max_T_counts)
+
+#If none of the transcripts account for >80% of the gene counts, then we can assume there could be multiple transcripts with different non-overlapping TSS. For these, we want to capture the isoforms less stringently, so we assign a >=0.60 threshold. 
+
+gex_all_leftover <- gex_all_leftover%>%
+  dplyr::filter(gex_all_leftover$pct>=0.60)
+
+gex_all_final <- rbind(gex_all_80,gex_all_leftover)
+
+#A second filter for gene name added -> MKKS for example has multiple different ENSGs, but is the same gene, with the same gene name for each entry.
+
+gtf_data <- read.csv("./featurecounts/enst_in_roi_nolastexon.gtf",sep="\t",header=F)
+colnames(gtf_data) <- c("seqname", "source", "feature", "start", "end", "score", "strand", "frame", "attribute")
+# Extract ENSG IDs and gene names
+gene_map <- gtf_data %>%
+  filter(feature == "transcript") %>%
+  mutate(
+    gene_id = str_extract(attribute, "gene_id ([^;]+)"),
+    gene_name = str_extract(attribute, "gene_name ([^;]+)")
+  ) %>%
+  transmute(
+    gene_id = str_remove(gene_id, "gene_id "),
+    gene_name = str_remove(gene_name, "gene_name ")
+  ) %>%
+  distinct(gene_id, gene_name)
+
+
+# Join the gene names to your dataframe
+gex_all_final <- gex_all_final %>%
+  left_join(gene_map, by = c("Gene" = "gene_id"))
+
+gex_transcripts <- gex_all_final%>%
+  dplyr::select(Transcript)
+
+#We add the Zim3-dCas9 annotation back in. It was missing as the transcript was not present in our RNA-seq data on parental cells and does not have transcript isoforms to help with transcript picking.
+
+zim3 <- head(gex_transcripts,1)
+zim3$Transcript <- "Zim3-dCas9Zim3-P2A-Hygro"
+
+gex_transcripts1 <- rbind(gex_transcripts,zim3)
+
+write.table(gex_transcripts1,file="./featurecounts_gex_top_transcripts.txt",col.names = F,row.names = F,quote = F,sep=",")
+
+#We extract all gtf entries for our optimal transcripts for probe design.
+
+ensembl_gtf_pc <- read.csv("./featurecounts/enst_in_roi_nolastexon.gtf",sep="\t",header=F)
+zim3_gtf <- read.csv("Zim3.gtf",sep="\t",header=F)
+ensembl_gtf <- rbind(ensembl_gtf_pc,zim3_gtf)
+
+pattern <- paste(gex_transcripts1$Transcript,collapse="|")
+
+gex_filtered_ensembl_gtf <- ensembl_gtf[grep(pattern, ensembl_gtf$V9), ]
+
+write.table(gex_filtered_ensembl_gtf,"./GEX_expressedtranscripts_80pct_v3_nolastexon.gtf",sep="\t",quote = F,row.names = F,col.names = F)
+```
+
+```{r}
+#Next, we use our 5' scRNA-seq bam file and the gtf generated in the step above to generate a bedgraph which reports the base coverage of correctly-oriented paired reads across all of our transcripts of interest. This allows peak-calling for probe design.
+
+library(GenomicRanges)
+library(rtracklayer)
+library(GenomicAlignments)
+library(data.table)
+library(parallel)
+library(pbapply)
+library(R.utils)
+
+calculate_strand_specific_coverage <- function(exons, bam_file) {
+  exons_df <- exons
+  transcript_strand <- unique(exons_df$strand)
+  
+  gr <- GRanges(seqnames = exons_df$seqnames,
+                ranges = IRanges(start = exons_df$start, end = exons_df$end),
+                strand = transcript_strand)
+  
+  param <- ScanBamParam(which = gr, what = c("flag"))
+  reads <- readGAlignments(bam_file, param = param)
+  
+  # Function to check if a read pair is correctly oriented
+  is_correct_pair <- function(flags, transcript_strand) {
+    is_paired <- bitwAnd(flags, 0x1) != 0
+    is_proper_pair <- bitwAnd(flags, 0x2) != 0
+    is_read1 <- bitwAnd(flags, 0x40) != 0
+    is_reverse <- bitwAnd(flags, 0x10) != 0
+    
+    if (transcript_strand == "+") {
+      (is_paired & is_proper_pair & 
+       ((is_read1 & !is_reverse) | (!is_read1 & is_reverse)))
+    } else {
+      (is_paired & is_proper_pair & 
+       ((is_read1 & is_reverse) | (!is_read1 & !is_reverse)))
+    }
+  }
+  
+  # Filter reads based on correct orientation
+  flags <- mcols(reads)$flag
+  correct_orientation <- is_correct_pair(flags, transcript_strand)
+  filtered_reads <- reads[correct_orientation]
+  
+  # Convert reads to GRanges, handling spliced reads
+  read_ranges <- unlist(grglist(filtered_reads))
+  
+  # Calculate coverage
+  cov <- coverage(read_ranges)
+  
+  stitched_cov <- lapply(seq_along(gr), function(i) {
+    chr <- as.character(seqnames(gr)[i])
+    start_pos <- start(gr)[i]
+    end_pos <- end(gr)[i]
+    
+    if (chr %in% names(cov)) {
+      exon_cov <- as.numeric(cov[[chr]][start_pos:end_pos])
+      if (transcript_strand == "-") {
+        exon_cov <- rev(exon_cov)
+      }
+      exon_cov
+    } else {
+      rep(0, end_pos - start_pos + 1)
+    }
+  })
+  
+  return(stitched_cov)
+}
+
+# Load GTF file
+gtf <- import("./GEX_expressedtranscripts_80pct_v3_nolastexon.gtf")
+bam_file <- BamFile("Non-Targeting_deduplicated_merged.bam")
+
+# Include only exons
+exons <- gtf[gtf$type == "exon"]
+
+# Create a list of data frames for each transcript
+exons_by_transcript <- split(as.data.frame(exons), exons$transcript_id)
+
+# Calculate coverage for each transcript
+cat("Starting coverage calculation for each transcript...\n")
+coverage_list <- pblapply(names(exons_by_transcript), function(transcript_id) {
+  tryCatch({
+    withTimeout({
+      exons <- exons_by_transcript[[transcript_id]]
+      calculate_strand_specific_coverage(exons, bam_file)
+    }, timeout = 600)  # 10 minutes timeout
+  }, error = function(e) {
+    if (inherits(e, "TimeoutException")) {
+      cat("Timeout occurred for transcript. Skipping.\n")
+      return(NULL)
+    } else {
+      stop(e)
+    }
+  })
+}, cl = min(detectCores() - 1, 16))  # Limit to 16 cores or less
+
+names(coverage_list) <- names(exons_by_transcript)
+
+# Remove NULL entries (timed out transcripts)
+coverage_list <- coverage_list[!sapply(coverage_list, is.null)]
+
+cat("\nCreating bedGraph data...\n")
+
+# Create an empty list to store the final bedGraph data
+bedgraph_data_list <- list()
+
+# Get unique transcript IDs
+unique_transcript_ids <- names(coverage_list)
+
+pb <- txtProgressBar(min = 0, max = length(unique_transcript_ids), style = 3)
+
+for (i in seq_along(unique_transcript_ids)) {
+    transcript_id <- unique_transcript_ids[i]
+    coverage_values <- coverage_list[[transcript_id]]
+    regions <- exons_by_transcript[[transcript_id]]
+    
+    strand <- unique(regions$strand)
+    regions <- regions[order(regions$start), ]
+    
+    total_length <- sum(regions$end - regions$start + 1)
+    
+    transcript_df <- data.frame()
+    relative_position <- 0
+    
+    if (strand == "-") {
+        regions <- regions[nrow(regions):1, ]
+        coverage_values <- rev(coverage_values)
+    }
+    
+    for (j in 1:nrow(regions)) {
+        exon_coverage <- coverage_values[[j]]
+        exon_length <- length(exon_coverage)
+        
+        if (strand == "-") {
+            start_pos <- total_length - relative_position - exon_length
+            end_pos <- total_length - relative_position - 1
+        } else {
+            start_pos <- relative_position
+            end_pos <- relative_position + exon_length - 1
+        }
+        
+        exon_df <- data.frame(
+            transcript = rep(transcript_id, exon_length),
+            start = start_pos:end_pos,
+            end = (start_pos + 1):(end_pos + 1),
+            score = exon_coverage
+        )
+        
+        transcript_df <- rbind(transcript_df, exon_df)
+        relative_position <- relative_position + exon_length
+    }
+    
+    bedgraph_data_list[[transcript_id]] <- transcript_df
+    
+    setTxtProgressBar(pb, i)
+}
+
+close(pb)
+
+cat("\nCombining data and writing to file...\n")
+
+# Combine all transcript data frames into a single data frame
+bedgraph_data <- do.call(rbind, bedgraph_data_list)
+
+# Reset row names
+rownames(bedgraph_data) <- NULL
+
+# Write to bedGraph file
+write.table(bedgraph_data, file = "./transcript_coverage_strand_specific_v3_nolastexon.bedgraph", sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+cat("\nProcessing complete. BedGraph file has been written.\n")
+```
+
+
+```{r}
+#Next, we use our bedgraph to extract one target region from each transcript for probe design. We note the coordinate within each transcript which contains the highest read coverage and scan in each direction until a base with 0.1x the coverage of the maximum coverage is reached or the end of the transcript is reached (The 0.1x boundary is used to prevent going into exons which have no coverage when the wrong transcript is selected. These regions will be smaller and often use the same transcript start site, thus excluded when checking for overlaps). Next, the smallest region within this region which accounts for 80% of all reads is obtained. If the region contains <80% of reads, the whole region is used. If the region is <300 nt, it is extended 5', then 3' until it reaches 300 nt in size (our library insert length), so long as it does not pass the region boundaries.
+
+cov <- read.csv("./transcript_coverage_strand_specific_v3_nolastexon.bedgraph",sep="\t",header=T)
+colnames(cov) <- c("transcript", "start", "end", "coverage")
+
+# Assuming you have a data frame `transcript_to_gene` with columns `transcript` and `gene`
+transcript_to_gene <- gex_all_final%>%
+  dplyr::select(Transcript,Gene)
+colnames(transcript_to_gene) <- c("transcript","gene")
+
+zim3 <- head(transcript_to_gene,1)
+zim3$transcript <- "Zim3-dCas9Zim3-P2A-Hygro"
+zim3$gene <- "Zim3-dCas9Zim3-P2A-Hygro"
+transcript_to_gene <- rbind(transcript_to_gene,zim3)
+
+# Function to find the region covering at least 80% of the sum coverage
+find_80_percent_coverage_region <- function(data, transcript_name, gene_name) {
+  max_coord <- max(data$end)
+  coverage_vector <- rep(0, max_coord)
+  
+  for (i in 1:nrow(data)) {
+    coverage_vector[(data$start[i] + 1):data$end[i]] <- data$coverage[i]
+  }
+  
+  coverage_vector[is.na(coverage_vector)] <- 0
+  total_coverage <- sum(coverage_vector)
+  
+  if (total_coverage == 0) {
+    return(data.frame(transcript = transcript_name, gene = gene_name, start = 0, end = min(299, max_coord - 1), pre_extension_start = 0, pre_extension_end = min(299, max_coord - 1), pre_extension_length = 300, pre_extension_coverage = 0, region_length = 300, region_coverage = 0, total_coverage = 0, transcript_length = max_coord))
+  }
+  
+  highest_signal_coord <- which.max(coverage_vector)
+  max_signal_value <- coverage_vector[highest_signal_coord]
+  threshold_value <- 0.1 * max_signal_value
+  
+  left_bound <- highest_signal_coord
+  while (left_bound > 1 && coverage_vector[left_bound] >= threshold_value) {
+    left_bound <- left_bound - 1
+  }
+  left_bound <- left_bound + 1  # Adjust to exclude the boundary base
+  
+  right_bound <- highest_signal_coord
+  while (right_bound < length(coverage_vector) && coverage_vector[right_bound] >= threshold_value) {
+    right_bound <- right_bound + 1
+  }
+  right_bound <- right_bound - 1  # Adjust to exclude the boundary base
+  
+  left_bound <- max(1, left_bound)
+  right_bound <- min(length(coverage_vector), right_bound)
+  
+  target_coverage <- 0.8 * total_coverage
+  
+  min_length <- max_coord
+  best_start <- left_bound
+  best_end <- right_bound
+  
+  for (start_idx in left_bound:right_bound) {
+    current_sum <- 0
+    for (end_idx in start_idx:right_bound) {
+      current_sum <- current_sum + coverage_vector[end_idx]
+      if (current_sum >= target_coverage) {
+        if ((end_idx - start_idx + 1) < min_length) {
+          min_length <- end_idx - start_idx + 1
+          best_start <- start_idx
+          best_end <- end_idx
+        }
+        break
+      }
+    }
+  }
+  
+  pre_extension_start <- best_start - 1  # Convert to 0-based coordinate
+  pre_extension_end <- best_end - 1  # Convert to 0-based coordinate
+  pre_extension_length <- pre_extension_end - pre_extension_start + 1
+  pre_extension_coverage <- sum(coverage_vector[(pre_extension_start + 1):(pre_extension_end + 1)])  # Adjust for 0-based index
+  
+  extended_start <- best_start - 1  # Start with the pre-extension region, adjusted to 0-based
+  extended_end <- best_end - 1  # Start with the pre-extension region, adjusted to 0-based
+  
+  if (sum(coverage_vector[extended_start:extended_end]) == 0) {
+    extended_start <- 0
+    extended_end <- min(299, max_coord - 1)
+  }
+  
+  if ((extended_end - extended_start + 1) > 300) {
+    extended_end <- extended_start + 299
+  }
+  
+  region_length <- extended_end - extended_start + 1
+  region_coverage <- sum(coverage_vector[extended_start:extended_end])
+  
+  # Ensure the region is at least 300 bases but do not extend past the 0.1 boundary
+  if (region_length < 300) {
+    initial_extended_start <- extended_start
+    initial_extended_end <- extended_end
+    
+    if (extended_start > 0) {
+      additional_bases <- 300 - region_length
+      extended_start <- max(0, extended_start - additional_bases)
+    }
+    if ((extended_end - extended_start + 1) < 300) {
+      additional_bases <- 300 - (extended_end - extended_start + 1)
+      extended_end <- min(max_coord, extended_end + additional_bases)
+    }
+    
+    # Ensure we do not extend past the initial bounds set by the 0.1 threshold
+    if (extended_start < left_bound - 1) {
+      extended_start <- left_bound - 1
+    }
+    if (extended_end > right_bound - 1) {
+      extended_end <- right_bound - 1
+    }
+    
+    # If the region is still less than 300 bases after the constraints, retain the original boundaries
+    if ((extended_end - extended_start + 1) < 300) {
+      extended_start <- initial_extended_start
+      extended_end <- initial_extended_end
+    }
+  }
+  
+  region_length <- extended_end - extended_start + 1
+  region_coverage <- sum(coverage_vector[extended_start:extended_end])
+  
+  return(data.frame(transcript = transcript_name, gene = gene_name, start = extended_start, end = extended_end, pre_extension_start = pre_extension_start, pre_extension_end = pre_extension_end, pre_extension_length = pre_extension_length, pre_extension_coverage = pre_extension_coverage, region_length = region_length, region_coverage = region_coverage, total_coverage = total_coverage, transcript_length = max_coord))
+}
+
+# Split the data by transcript
+split_data <- split(cov, cov$transcript)
+
+# Apply the function to each subset of the data and calculate total coverage
+results_list <- lapply(names(split_data), function(name) {
+  gene_name <- transcript_to_gene$gene[transcript_to_gene$transcript == name]
+  if (length(gene_name) == 0) {
+    gene_name <- "unknown"
+  }
+  find_80_percent_coverage_region(split_data[[name]], name, gene_name)
+})
+
+results_df <- do.call(rbind, results_list)
+results_df$start[results_df$start == 1] <- 0
+
+filter_bed <- results_df%>%
+  dplyr::select(transcript,pre_extension_start,pre_extension_end)
+
+write.table(filter_bed,file="./probes_unfiltered.bed",quote = F,row.names = F,col.names = F,sep="\t")
+```
+
+```{r}
+#After extracting the regions to design probes against, we can extract their sequence and remove overlapping regions. First the corresponding sequence is extracted using 'bedtools getfasta -fi refdata-gex-GRCh38-2024-A-dCas9Zim3.fa -bed probes_unfiltered.bed -fo probes_unfiltered.fa'. Then each sequence is compared to every other sequence and if one is a subset of another, the larger one is kept. If two are equal, the one with the higher read counts is kept. Removed regions are noted in a new column "enveloped" for visualization. The regions are then saved as a bed file and used to extract the probes as a .fasta from our salmon transcriptome .fasta.
+
+library(Biostrings)
+
+# Load the fasta file
+fasta_file <- readDNAStringSet("./probes_unfiltered.fa")
+
+# Initialize logical vector to keep track of sequences to keep
+keep_indices <- logical(length(fasta_file))
+removed_entries <- character(0)
+
+# Set all sequences to be kept initially
+for (i in seq_along(fasta_file)) {
+  keep_indices[i] <- TRUE
+}
+
+# Function to check if one sequence is a subsequence of another
+is_subsequence <- function(seq1, seq2) {
+  matches <- matchPattern(seq1, seq2)
+  length(matches) > 0
+}
+
+# Compare each sequence to all others
+for (i in seq_along(fasta_file)) {
+  if (!keep_indices[i]) next
+  for (j in seq_along(fasta_file)) {
+    if (i != j) {
+      if (width(fasta_file)[i] <= width(fasta_file)[j] && 
+          is_subsequence(fasta_file[[i]], fasta_file[[j]])) {
+        keep_indices[i] <- FALSE
+        removed_entries <- c(removed_entries, names(fasta_file)[i])
+        break
+      } else if (as.character(fasta_file[[i]]) == as.character(fasta_file[[j]])) {
+        keep_indices[j] <- FALSE
+        removed_entries <- c(removed_entries, names(fasta_file)[j])
+      }
+    }
+  }
+}
+
+# Filter the fasta file to keep only the sequences that passed the checks
+filtered_fasta <- fasta_file[keep_indices]
+
+# Save removed entries as a data frame
+removed_entries_df <- as.data.frame(removed_entries)
+removed_entries_df$removed_entries <- sub(":.*", "", removed_entries_df$removed_entries)
+
+results_df$enveloped <- results_df$transcript%in%removed_entries_df$removed_entries
+
+final_results_df <- results_df %>%
+  group_by(gene) %>%
+  mutate(all_enveloped = all(enveloped)) %>%
+  filter(
+    (!enveloped) | 
+    (all_enveloped & total_coverage == max(total_coverage))
+  ) %>%
+  ungroup()
+
+your_bed_file <- final_results_df%>%
+  dplyr::select(transcript,start,end)
+write.table(your_bed_file,"your_bed_file.bed",sep="\t",quote = F,col.names = F,row.names = F)
+```
+
+```{r}
+#Due to how comprehensive ensembl annotations are, in some situations you can have two nearly identical transcripts which only differ by the first exon of one transcript starting a few bases upstream of another transcript's first exon. Although the same region is used for probe design, one of those transcripts cannot go as far upstream as the other and is thus not observed as a subset and cannot be removed. If you want to filter your regions further to remove these regions, I extract all exons from each transcript which overlap a probe region during the peak-calling procedure and remove these truncated transcripts if they are a direct overlap of another. In my case, this removes ~7% of our regions, leading to fewer unnecessary probes designed.
+
+create_transcript_coordinate_mapping <- function(gtf_file) {
+  # Read GTF file
+  gtf <- read.table(gtf_file, sep="\t", quote="", comment.char="#", stringsAsFactors=FALSE)
+  colnames(gtf) <- c("seqnames", "source", "feature", "start", "end", "score", "strand", "frame", "attribute")
+  
+  # Extract transcript_id and exon_number from attribute column
+  gtf$transcript_id <- gsub('.*transcript_id "([^"]+)".*', "\\1", gtf$attribute)
+  gtf$exon_number <- as.integer(gsub('.*exon_number "([^"]+)".*', "\\1", gtf$attribute))
+  
+  # Filter for exons only
+  exons <- gtf[gtf$feature == "exon", ]
+  
+  # Create a mapping for each transcript
+  transcript_mapping <- exons %>%
+    group_by(transcript_id) %>%
+    arrange(transcript_id, exon_number) %>%
+    mutate(
+      exon_length = end - start + 1,
+      cumulative_length = cumsum(exon_length),
+      transcript_start = lag(cumulative_length, default = 0),
+      transcript_end = cumulative_length - 1
+    ) %>%
+    ungroup() %>%
+    select(transcript_id, seqnames, start, end, strand, exon_number, transcript_start, transcript_end)
+  
+  return(transcript_mapping)
+}
+
+transcriptome_to_genomic <- function(transcript_id, t_start, t_end, mapping) {
+  transcript_exons <- mapping[mapping$transcript_id == transcript_id, ]
+  
+  if (nrow(transcript_exons) == 0) {
+    warning(paste("Transcript not found:", transcript_id))
+    return(NULL)
+  }
+  
+  strand <- unique(transcript_exons$strand)
+  
+  results <- transcript_exons %>%
+    filter(
+      (transcript_start <= t_start & t_start <= transcript_end) |
+      (transcript_start <= t_end & t_end <= transcript_end) |
+      (t_start <= transcript_start & transcript_end <= t_end)
+    ) %>%
+    mutate(
+      overlap_start = pmax(transcript_start, t_start),
+      overlap_end = pmin(transcript_end, t_end),
+      genomic_start = ifelse(strand == "+",
+                             start + (overlap_start - transcript_start),
+                             end - (overlap_end - transcript_start)),
+      genomic_end = ifelse(strand == "+",
+                           start + (overlap_end - transcript_start),
+                           end - (overlap_start - transcript_start))
+    ) %>%
+    select(seqnames, genomic_start, genomic_end, strand, exon_number)
+  
+  return(results)
+}
+
+# Load the GTF file and create the mapping
+gtf_file <- "./featurecounts/enst_in_roi_nolastexon.gtf"
+mapping <- create_transcript_coordinate_mapping(gtf_file)
+
+# Read the BED file
+bed_df <- read.table("your_bed_file.bed", header=FALSE, stringsAsFactors=FALSE)
+colnames(bed_df) <- c("transcript", "start", "end")
+
+# Process the bed file and convert coordinates
+results <- lapply(1:nrow(bed_df), function(i) {
+  row <- bed_df[i, ]
+  tryCatch({
+    coords <- transcriptome_to_genomic(row$transcript, row$start, row$end, mapping)
+    if (!is.null(coords) && nrow(coords) > 0) {
+      cbind(transcript = row$transcript, 
+            t_start = row$start, 
+            t_end = row$end, 
+            coords)
+    } else {
+      NULL
+    }
+  }, warning = function(w) {
+    message(paste("Warning for row", i, ":", conditionMessage(w)))
+    NULL
+  }, error = function(e) {
+    message(paste("Error processing row", i, ":", conditionMessage(e)))
+    NULL
+  })
+})
+
+
+# Remove NULL results and combine into a single data frame
+results <- do.call(rbind, Filter(Negate(is.null), results))
+
+#Results contains our peak regions in transcriptomic and genomic coordinates.
+
+gtf <- "./featurecounts/enst_in_roi_nolastexon.gtf"
+  # Read GTF file
+  gtf <- read.table(gtf_file, sep="\t", quote="", comment.char="#", stringsAsFactors=FALSE)
+  colnames(gtf) <- c("seqnames", "source", "feature", "start", "end", "score", "strand", "frame", "attribute")
+  
+  
+extract_matching_gtf_entries <- function(results, gtf) {
+  # Function to extract info from attribute string
+  extract_attribute <- function(attr, key) {
+    str_extract(attr, paste0(key, ' "([^"]+)"')) %>% 
+      str_extract('"([^"]+)"') %>% 
+      str_remove_all('"')
+  }
+  
+  matching_entries <- lapply(1:nrow(results), function(i) {
+    result_row <- results[i, ]
+    transcript_id <- result_row$transcript
+    genomic_start <- result_row$genomic_start
+    genomic_end <- result_row$genomic_end
+    chr <- result_row$seqnames
+    
+    # Extract ENST ID from the transcript column
+    enst_id <- str_extract(transcript_id, "ENST\\d+")
+    
+    matching_gtf <- gtf %>%
+      filter(seqnames == chr,
+             str_detect(attribute, paste0("transcript_id \"", enst_id, "\"")),
+             feature == "exon",
+             ((start >= genomic_start & start <= genomic_end) |
+              (end >= genomic_start & end <= genomic_end) |
+              (start <= genomic_start & end >= genomic_end)))
+    
+    if (nrow(matching_gtf) > 0) matching_gtf else NULL
+  })
+  
+  combined_entries <- do.call(rbind, Filter(Negate(is.null), matching_entries))
+  
+  # Remove duplicate entries
+  distinct_entries <- combined_entries %>%
+    distinct(seqnames, start, end, strand, attribute, .keep_all = TRUE)
+  
+  # Sort entries
+  sorted_entries <- distinct_entries %>%
+    arrange(seqnames, start, end)
+  
+  return(sorted_entries)
+}
+
+# Extract matching GTF entries
+matched_entries <- extract_matching_gtf_entries(results, gtf)
+
+#matched_entries contains the exons our probe regions overlap. These can be used to extract their fasta sequence and remove overlaps as done for our regions earlier.
+
+write.table(matched_entries,"matched_entries.gtf",col.names = F,row.names = F,sep="\t",quote = F)
+```
+
+
+```{r}
+#agat_sp_extract_sequences.pl --gff matched_entries.gtf --fasta genome.fa -t exon --merge -o matched_entries_exonpeaks.fa
+
+filter_fl <- readDNAStringSet("./matched_entries_exonpeaks.fa")
+
+# Initialize logical vector to keep track of sequences to keep
+keep_indices <- logical(length(filter_fl))
+removed_entries <- character(0)
+
+# Set all sequences to be kept initially
+for (i in seq_along(filter_fl)) {
+  keep_indices[i] <- TRUE
+}
+
+# Function to check if one sequence is a subsequence of another
+is_subsequence <- function(seq1, seq2) {
+  matches <- matchPattern(seq1, seq2)
+  length(matches) > 0
+}
+
+# Compare each sequence to all others
+for (i in seq_along(filter_fl)) {
+  if (!keep_indices[i]) next
+  for (j in seq_along(filter_fl)) {
+    if (i != j) {
+      if (width(filter_fl)[i] <= width(filter_fl)[j] && 
+          is_subsequence(filter_fl[[i]], filter_fl[[j]])) {
+        keep_indices[i] <- FALSE
+        removed_entries <- c(removed_entries, names(filter_fl)[i])
+        break
+      } else if (as.character(filter_fl[[i]]) == as.character(filter_fl[[j]])) {
+        keep_indices[j] <- FALSE
+        removed_entries <- c(removed_entries, names(filter_fl)[j])
+      }
+    }
+  }
+}
+
+# Filter the fasta file to keep only the sequences that passed the checks
+filtered_fasta_2 <- filter_fl[keep_indices]
+
+# Save removed entries as a data frame
+removed_entries_df_2 <- as.data.frame(removed_entries)
+removed_entries_df_2$removed_entries <- sub(" gene.*", "", removed_entries_df_2$removed_entries)
+
+#When agat is run, it will automatically remove any identical transcripts and tell you what they were. We can filter our final results to remove them.
+agat_f <- read.csv("agat_filter.txt",header=F,sep="\t")
+
+# Save removed entries as a data frame
+
+final_results_df$enveloped <- final_results_df$transcript%in%removed_entries_df_2$removed_entries
+
+final_results_df_2 <- final_results_df%>%
+    group_by(gene) %>%
+  mutate(all_enveloped = all(enveloped)) %>%
+  filter(
+    (!enveloped) | 
+    (all_enveloped & total_coverage == max(total_coverage))
+  ) %>%
+  ungroup()%>%
+  dplyr::filter(!transcript%in%agat_f$V1)
+
+
+final_results_df$exonfilter <- final_results_df$transcript%in%final_results_df_2$transcript
+```
+
+
+```{r}
+#After filtering for overlapping probes and overlapping exons, we export a gtf file of the transcripts used to design probes, then we extract a gtf of the probes themselves, that we can load onto IGV and visually inspect.
+
+ensembl_gtf_pc <- read.csv("./featurecounts/enst_in_roi_nolastexon.gtf",sep="\t",header=F)
+zim3_gtf <- read.csv("./ensembl_v2/salmon_index/Zim3.gtf",sep="\t",header=F)
+ensembl_gtf <- rbind(ensembl_gtf_pc,zim3_gtf)
+
+pattern <- paste(final_results_df_2$transcript,collapse="|")
+
+gex_filtered_ensembl_gtf <- ensembl_gtf[grep(pattern, ensembl_gtf$V9), ]
+
+write.table(gex_filtered_ensembl_gtf,"./GEX_FINAL_PROBED_TRANSCRIPTS.gtf",sep="\t",quote = F,row.names = F,col.names = F)
+```
+
+
+```{r}
+#This final code below goes back and takes the genomic coordinates of our target regions and retains the meta-information about the transcript they came from, allowing us to use it as a GTF file for visual inspection in IGV.
+
+extract_matching_gtf_entries <- function(results, gtf) {
+  # Function to extract info from attribute string
+  extract_attribute <- function(attr, key) {
+    str_extract(attr, paste0(key, ' "([^"]+)"')) %>% 
+      str_extract('"([^"]+)"') %>% 
+      str_remove_all('"')
+  }
+  
+  matching_entries <- lapply(1:nrow(results), function(i) {
+    result_row <- results[i, ]
+    transcript_id <- result_row$transcript
+    genomic_start <- result_row$genomic_start
+    genomic_end <- result_row$genomic_end
+    chr <- result_row$seqnames
+    
+    # Extract ENST ID from the transcript column
+    enst_id <- str_extract(transcript_id, "ENST\\d+")
+    
+    matching_gtf <- gtf %>%
+      filter(seqnames == chr,
+             str_detect(attribute, paste0("transcript_id \"", enst_id, "\"")),
+             feature == "exon",
+             ((start <= genomic_end & end >= genomic_start))) %>%
+      # Calculate overlap
+      mutate(overlap = pmin(as.numeric(end), genomic_end) - pmax(as.numeric(start), genomic_start))
+    
+    if (nrow(matching_gtf) > 0) {
+      # Select the row with maximum overlap
+      best_match <- matching_gtf[which.max(matching_gtf$overlap), ]
+      
+      # Replace start and end with genomic_start and genomic_end from results
+      best_match$start <- genomic_start
+      best_match$end <- genomic_end
+      
+      best_match
+    } else {
+      NULL
+    }
+  })
+  
+  combined_entries <- do.call(rbind, Filter(Negate(is.null), matching_entries))
+  
+  # Remove duplicate entries
+  distinct_entries <- combined_entries %>%
+    distinct(seqnames, start, end, strand, attribute, .keep_all = TRUE)
+  
+  # Sort entries
+  sorted_entries <- distinct_entries %>%
+    arrange(seqnames, start, end) %>%
+    select(-overlap)  # Remove the overlap column
+  
+  return(sorted_entries)
+}
+
+# Assuming your results and GTF data are already loaded into R as data frames
+# named 'results' and 'gtf' respectively
+
+# Extract matching GTF entries
+matched_entries <- extract_matching_gtf_entries(results, gtf)
+
+# Read GTF 1 and extract transcript IDs
+filter_ids <- gex_filtered_ensembl_gtf %>%
+  pull(V9) %>%
+  str_extract("transcript_id [^;]+") %>%
+  str_remove("transcript_id ") %>%
+  str_remove_all('"') %>%
+  unique()
+
+# Read GTF 2, extract transcript IDs, and filter
+matched_entries1 <- matched_entries %>%
+  filter(str_extract(attribute, 'transcript_id "([^"]+)"') %>% 
+           str_remove('transcript_id "') %>% 
+           str_remove('"') %in% filter_ids)
+
+
+write.table(matched_entries1,"GEX_FINAL_PROBES.gtf",col.names = F,row.names = F,quote = F,sep="\t")
+```
+
+
+
+```{r}
+extract_final_probes_bed <- final_results_df_2%>%
+  dplyr::select(transcript,pre_extension_start,pre_extension_end)
+
+write.table(extract_final_probes_bed,file="./GEX_FINAL_PROBES.bed",quote = F,row.names = F,col.names = F,sep="\t")
+
+#After extracting the regions to design probes against, we can extract their sequence and remove overlapping regions: bedtools getfasta -fi refdata-gex-GRCh38-2024-A-dCas9Zim3.fa -bed probes_final.bed -fo GEX_FINAL_PROBES.fa
+```

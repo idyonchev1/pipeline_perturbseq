@@ -21,3 +21,4 @@ CellRanger version: 8.0.1
 MultiQC v1.21
 FastQC 0.12.1
 
+Probe design for target enrichment design documented in scripts/Probe_Design.Rmd . Requires execution of rules/sinto.smk and the salmon_quant pipeline.
