@@ -22,3 +22,5 @@ MultiQC v1.21
 FastQC 0.12.1
 
 Probe design for target enrichment design documented in scripts/Probe_Design.Rmd . Requires execution of rules/sinto.smk and the salmon_quant pipeline.
+Experimental data showing efficiency of probe design showcased in Target_Enrichment_Fig1.png and Target_Enrichment_Fig2.png.
+3.2x more UMIs per target were observed at a 5.3-fold lower sequencing depth.
