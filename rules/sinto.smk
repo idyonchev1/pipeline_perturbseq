@@ -19,7 +19,9 @@ rule extract_targets_sinto:
     input:
         sample="{samples}/outs/possorted_genome_bam.bam",
         targets="{samples}_target_identities.tsv"
-    output:touch("logs/{samples}_sinto_done.txt")
+    output:
+        flag=touch("logs/{samples}_sinto_done.txt"),
+        bams=expand("demultiplex_cells/{{samples}}/{target}.bam",target=target)
     log:
         "logs/{samples}_extract_targets_sinto.log"
     threads:32
@@ -31,20 +33,8 @@ rule extract_targets_sinto:
     shell:
         """
         sinto filterbarcodes -b {input.sample} -c {input.targets} --outdir demultiplex_cells/{wildcards.samples} -p 32 &> {log}
-        rm demultiplex_cells/{wildcards.samples}/*_*
         samtools index -M demultiplex_cells/{wildcards.samples}/*bam
         """
-
-rule checkpoint:
-    input:
-        "logs/{sample}_sinto_done.txt"
-    output:
-        temp(expand("demultiplex_cells/{sample}/{target}.bam",sample="{sample}",target=target))
-    threads:1
-    resources:
-        mem_mb=2000,
-        time="1:00:00"
-    shell:"touch {input}"
 
 rule deduplicate:
     input:
